@@ -1,0 +1,10 @@
+torch==2.15.0
+transformers==5.22.2
+datasets==5.2.0
+huggingface_hub==2.4.0
+scikit-learn==1.9.1
+pandas==3.1.1
+seaborn==0.13.2
+matplotlib==3.11.2
+nbconvert==7.17.2
+ipykernel
