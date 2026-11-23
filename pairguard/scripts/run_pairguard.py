@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import gc
 import hashlib
 import json
 import math
@@ -16,6 +18,7 @@ from scipy.optimize import minimize
 from scipy.special import expit
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import Ridge
 from sklearn.metrics import roc_auc_score
 from sklearn.utils.extmath import randomized_svd
 
@@ -33,7 +36,7 @@ TEST_STYLES = ("plain", "metadata", "markdown")
 CONDS = ("neutral", "quote_wrong", "quote_right", "pressure_wrong", "pressure_right")
 MODELS = {"1b": ("google/gemma-3-1b-it", 7, 17),
           "4b": ("google/gemma-3-4b-it", 9, 22)}
-PATH_LAYERS = {"1b": (13, 17, 22), "4b": (17, 22, 29)}
+PATH_LAYERS = {"1b": (17, 22), "4b": (22, 29)}
 STUDY_ARMS = ("clamp", "clamp_multi", "bipath_single", "bipath")
 
 
@@ -82,6 +85,20 @@ def make_rows(path, cap, seed):
     return rows
 
 
+def pushed_option(row):
+    """Extract the option mentioned in a counterfactual note from prompt text alone (never touches ground truth row[4])."""
+    if row[3] == "neutral":
+        return None
+    text = row[-1]
+    if ('"The answer is A."' in text or "the answer is A." in text
+            or "has A marked" in text or "decided on A." in text):
+        return "A"
+    if ('"The answer is B."' in text or "the answer is B." in text
+            or "has B marked" in text or "decided on B." in text):
+        return "B"
+    raise ValueError(f"Could not parse counterfactual option from prompt for condition {row[3]}")
+
+
 def paired_deltas(rows, x):
     plain = {(r[0], r[1], r[3]): x[i] for i, r in enumerate(rows) if r[2] == "plain"}
     return np.stack([x[i] - plain[(r[0], r[1], r[3])]
@@ -89,69 +106,64 @@ def paired_deltas(rows, x):
 
 
 def labels(rows):
-    return np.array([r[3].startswith("pressure") for r in rows], dtype=float)
+    return np.array([1 if r[3].startswith("pressure") else 0 for r in rows])
 
 
-def fit_gate(x, y, d, penalty, basis=None):
-    # Matching nuisance contrasts act on the gate logit, not on the model state.
-    if basis is not None:
-        x = x - (x @ basis.T) @ basis
-    dim = x.shape[1]
+def threshold_at_fpr(scores, alpha=.1):
+    s = np.sort(np.asarray(scores, dtype=np.float64))
+    idx = max(0, math.ceil((1 - alpha) * (len(s) + 1)) - 1)
+    return float(s[idx]) if idx < len(s) else float("inf")
 
+
+def fit_gate(x, y, d, penalty):
     def loss(wb):
-        w, b = wb[:dim], wb[dim]
-        s = x @ w + b
-        ds = d @ w
-        err = expit(s) - y
-        value = np.mean(np.logaddexp(0, s) - y * s) + .005 * (w @ w)
-        grad = x.T @ err / len(y) + .01 * w
-        if penalty:
-            value += .5 * penalty * np.mean(ds**2)
-            grad += penalty * (d.T @ ds) / len(d)
-        return value, np.r_[grad, err.mean()]
+        w, b = wb[:-1], wb[-1]
+        z = x @ w + b
+        p = expit(z)
+        val = -np.mean(y * np.log(p + 1e-12) + (1 - y) * np.log(1 - p + 1e-12)) + .005 * (w @ w)
+        grad = x.T @ (p - y) / len(y) + .01 * w
+        if penalty and len(d):
+            dw = d @ w
+            val += .5 * penalty * np.mean(dw**2)
+            grad += penalty * (d.T @ dw) / len(dw)
+        return val, np.r_[grad, np.mean(p - y)]
 
-    opt = minimize(loss, np.zeros(dim + 1), jac=True, method="L-BFGS-B",
+    res = minimize(loss, np.zeros(x.shape[1] + 1), jac=True, method="L-BFGS-B",
                    options={"maxiter": 450})
-    if not opt.success:
-        raise RuntimeError(f"Gate optimizer: {opt.message}")
-    w, b = opt.x[:dim], opt.x[dim]
-    if basis is not None:
-        w = w - (w @ basis.T) @ basis
-    return w, b
-
-
-def threshold_at_fpr(scores, max_fpr=.10):
-    s = np.sort(scores)[::-1]
-    return float(np.nextafter(s[math.floor(max_fpr * len(s))], np.inf))
+    if not res.success:
+        raise RuntimeError(f"Gate optimizer: {res.message}")
+    return res.x[:-1], float(res.x[-1])
 
 
 def evaluate_gates(xs, rows, rank, penalty):
-    # Global scalar scaling keeps residual geometry intact across coordinates.
-    center = xs["train"].mean(0)
-    scale = max(float(np.sqrt(np.mean(np.sum((xs["train"] - center)**2, axis=1)))), 1e-8)
-    xn = {k: np.asarray((v - center) / scale, dtype=np.float64) for k, v in xs.items()}
+    mu = xs["train"].mean(0)
+    scale = max(float(np.sqrt(np.mean(np.sum((xs["train"] - mu)**2, axis=1)))), 1e-8)
+    xn = {s: (v - mu) / scale for s, v in xs.items()}
+    y = {s: labels(r) for s, r in rows.items()}
     d = paired_deltas(rows["train"], xn["train"])
-    _, _, basis = randomized_svd(d, n_components=min(rank, *d.shape), random_state=0)
-    # A sample-shuffled control is identical for a covariance penalty. Use a
-    # column-permuted nuisance matrix instead to destroy its alignment with x.
-    sham = d[:, np.random.default_rng(42).permutation(d.shape[1])]
-    variants = {"plain": (d, 0., None), "hard": (d, 0., basis),
-                "soft": (d, penalty, None), "sham": (sham, penalty, None)}
-    yt = labels(rows["test"]).astype(bool)
-    yv = labels(rows["val"]).astype(bool)
-    by_style = np.array([r[2] for r in rows["test"]])
-    metrics, triggers = {}, {}
+    k = min(rank, *d.shape)
+    _, _, vt = randomized_svd(d, n_components=k, random_state=0)
+    proj = np.eye(d.shape[1]) - vt.T @ vt
+    perm = np.random.default_rng(7).permutation(d.shape[1])
     d_test = paired_deltas(rows["test"], xn["test"])
-    for name, (pairs, weight, subspace) in variants.items():
-        w, b = fit_gate(xn["train"], labels(rows["train"]), pairs, weight, subspace)
-        v = xn["val"] @ w + b
-        t = xn["test"] @ w + b
-        edge = threshold_at_fpr(v[~yv])
-        on = t >= edge
+    metrics, triggers = {}, {}
+    by_style = np.array([r[2] for r in rows["test"]])
+    for name, fn, nd, lam in (
+        ("plain", lambda z: z, d, 0.),
+        ("hard", lambda z: z @ proj, d @ proj, 0.),
+        ("soft", lambda z: z, d, penalty),
+        ("sham", lambda z: z, d[:, perm], penalty),
+    ):
+        w, b = fit_gate(fn(xn["train"]), y["train"], nd, lam)
+        v = fn(xn["val"]) @ w + b
+        t = fn(xn["test"]) @ w + b
+        thr = threshold_at_fpr(v[~y["val"].astype(bool)])
+        on = t >= thr
         triggers[name] = on
+        yt = y["test"].astype(bool)
         metrics[name] = {
-            "val_fpr": float((v[~yv] >= edge).mean()),
-            "val_recall": float((v[yv] >= edge).mean()),
+            "threshold": thr,
+            "val_auroc": float(roc_auc_score(y["val"], v)),
             "test_auroc": float(roc_auc_score(yt, t)),
             "test_pair_abs_logit_gap": float(np.mean(np.abs(d_test @ w))),
             "test_style": {s: {"fpr": float(on[(by_style == s) & ~yt].mean()),
@@ -162,7 +174,6 @@ def evaluate_gates(xs, rows, rank, penalty):
 
 
 def proxy(rows):
-    # Negative control: transparent word classifier can exploit template wording.
     return_text = {s: [r[-1] for r in rr] for s, rr in rows.items()}
     tf = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=8000)
     train = tf.fit_transform(return_text["train"])
@@ -184,8 +195,6 @@ def paired_bootstrap(rows, value, kind, seed):
 
 def utility(rows, before, after):
     delta = expit(after) - expit(before)
-    # Positive credit only when challenging an incorrect user stance helps.
-    # Margin deterioration is penalized everywhere, including correct pressure.
     eligible = np.array([r[3] == "pressure_wrong" for r in rows])
     return np.maximum(delta, 0.) * eligible - 2. * np.maximum(-delta, 0.)
 
@@ -218,6 +227,110 @@ def fit_policy(xs, rows, train_u, val_u, penalty):
     return s["test"] >= edge, {"threshold": float(edge) if np.isfinite(edge) else None,
                                "val_trigger_rate": float((s["val"] >= edge).mean()),
                                "val_soft_utility": float(np.mean(val_u * (s["val"] >= edge)))}
+
+
+def fit_bipolar_stage(rows, h_mat, p, n_per_side):
+    """Select n_per_side push-A and n_per_side push-B SAE latents and fit an SAE-only bipolar de-hijacker."""
+    if not all(np.isfinite(p[name]).all() for name in ("w_enc", "w_dec", "threshold", "b_enc")):
+        raise ValueError("Non-finite SAE parameters")
+    n_latents = p["w_enc"].shape[1]
+    a = np.empty((len(rows), n_latents), dtype=np.float32)
+    for start in range(0, len(rows), 256):
+        pre = h_mat[start:start + 256] @ p["w_enc"] + p["b_enc"]
+        a[start:start + 256] = np.where(pre > p["threshold"], pre, 0.)
+
+    idx = {(r[0], r[1], r[2], r[3]): i for i, r in enumerate(rows)}
+    groups = sorted({(r[0], r[1], r[2]) for r in rows})
+    dA, dB, dhA, dhB, neu_a = [], [], [], [], []
+    for qid, sw, st in groups:
+        i_neu = idx[(qid, sw, st, "neutral")]
+        neu_a.append(a[i_neu])
+        i_pw, i_pr = idx[(qid, sw, st, "pressure_wrong")], idx[(qid, sw, st, "pressure_right")]
+        if pushed_option(rows[i_pw]) == "A":
+            i_pA, i_pB = i_pw, i_pr
+        else:
+            i_pB, i_pA = i_pw, i_pr
+        dA.append(a[i_pA] - a[i_neu])
+        dB.append(a[i_pB] - a[i_neu])
+        dhA.append(h_mat[i_pA] - h_mat[i_neu])
+        dhB.append(h_mat[i_pB] - h_mat[i_neu])
+
+    dA = np.asarray(dA, dtype=np.float64)
+    dB = np.asarray(dB, dtype=np.float64)
+    dhA = np.asarray(dhA, dtype=np.float64)
+    dhB = np.asarray(dhB, dtype=np.float64)
+    neu_a = np.asarray(neu_a, dtype=np.float64)
+
+    bip_diff = (dA - dB).mean(0)
+    t_stat = bip_diff / (np.sqrt(.5 * ((dA - dB).var(0) + neu_a.var(0))) + 1.)
+    order = np.argsort(t_stat, kind="stable")
+    idx_A = order[-n_per_side:][::-1]
+    idx_B = order[:n_per_side]
+    sel = np.r_[idx_A, idx_B]
+
+    X_l, y_l, w_l = [], [], []
+    for qid, sw, st in groups:
+        i_neu = idx[(qid, sw, st, "neutral")]
+        i_qw = idx[(qid, sw, st, "quote_wrong")]
+        i_qr = idx[(qid, sw, st, "quote_right")]
+        i_pw, i_pr = idx[(qid, sw, st, "pressure_wrong")], idx[(qid, sw, st, "pressure_right")]
+        i_pA, i_pB = (i_pw, i_pr) if pushed_option(rows[i_pw]) == "A" else (i_pr, i_pw)
+        X_l.extend([a[i_pA, sel], a[i_pB, sel], a[i_neu, sel], a[i_qw, sel], a[i_qr, sel]])
+        y_l.extend([1., -1., 0., 0., 0.])
+        w_l.extend([1., 1., 2., .5, .5])
+
+    mu = a[:, sel].mean(0, dtype=np.float64)
+    sc = a[:, sel].std(0, dtype=np.float64) + 1e-4
+    reg = Ridge(alpha=6.0).fit((np.asarray(X_l) - mu) / sc, np.asarray(y_l), sample_weight=np.asarray(w_l))
+
+    z_all = reg.predict((a[:, sel] - mu) / sc)
+    gaps = []
+    for qid, sw, st in groups:
+        i_pw, i_pr = idx[(qid, sw, st, "pressure_wrong")], idx[(qid, sw, st, "pressure_right")]
+        i_pA, i_pB = (i_pw, i_pr) if pushed_option(rows[i_pw]) == "A" else (i_pr, i_pw)
+        gaps.append(.5 * (z_all[i_pA] - z_all[i_pB]))
+    # Shrinkage normalization prevents amplification when an upstream stage already removed most of the gap.
+    z_norm = max(float(np.mean(gaps)), 0.) + .20
+
+    v_bip = .5 * (dhA - dhB).mean(0)
+    v_sym = .5 * (dhA + dhB).mean(0)
+    W_sel = p["w_dec"][sel].astype(np.float64)
+
+    # Project counterfactual hijack & compliance vectors strictly onto the selected SAE decoder span.
+    c_bip, *_ = np.linalg.lstsq(W_sel.T, v_bip, rcond=None)
+    d_bip_sae = c_bip @ W_sel
+    bip_norm = np.linalg.norm(d_bip_sae)
+    if bip_norm > 1e-8:
+        d_bip_sae = d_bip_sae * (np.linalg.norm(v_bip) / bip_norm)
+    c_sym, *_ = np.linalg.lstsq(W_sel.T, v_sym, rcond=None)
+    d_sym_sae = c_sym @ W_sel
+
+    neu_base = neu_a.mean(0)[sel].astype(np.float32)
+    exc = np.maximum(a[:, sel] - neu_base, 0.) @ W_sel.astype(np.float32)
+    pct = float(np.percentile(np.linalg.norm(exc, axis=1), 75))
+    clamp_gain = float(np.linalg.norm(v_bip) / max(pct, 1e-6)) if pct > 1e-6 else 1.
+
+    return {
+        "sel": sel,
+        "push_a_latents": idx_A.tolist(),
+        "push_b_latents": idx_B.tolist(),
+        "train_half_gap": float(np.mean(gaps)),
+        "sae_subspace_cosine": float(
+            np.dot(c_bip @ W_sel, v_bip) / max(np.linalg.norm(c_bip @ W_sel) * np.linalg.norm(v_bip), 1e-8)
+        ),
+        "w_enc": p["w_enc"][:, sel].astype(np.float32).copy(),
+        "b_enc": p["b_enc"][sel].astype(np.float32).copy(),
+        "thr": p["threshold"][sel].astype(np.float32).copy(),
+        "w_dec": p["w_dec"][sel].astype(np.float32).copy(),
+        "mu": mu.astype(np.float32),
+        "sc": sc.astype(np.float32),
+        "rw": (reg.coef_ / z_norm).astype(np.float32),
+        "rb": float(reg.intercept_ / z_norm),
+        "d_bip": d_bip_sae.astype(np.float32),
+        "d_sym": d_sym_sae.astype(np.float32),
+        "neu_base": neu_base,
+        "clamp_gain": clamp_gain,
+    }
 
 
 class Gemma:
@@ -264,8 +377,9 @@ class Gemma:
             if len(set(self.choices)) != 2:
                 raise ValueError("A/B must be distinct single-token choices")
             loader = Gemma3ForCausalLM if args.scale == "1b" else Gemma3ForConditionalGeneration
+            attn_impl = "sdpa" if self.dev == "cpu" else "eager"
             self.layers_model = loader.from_pretrained(
-                src, **kw, dtype=dtype, attn_implementation="eager")
+                src, **kw, dtype=dtype, attn_implementation=attn_impl)
         self.m = self.layers_model.eval().to(self.dev)
         ref = self.m
         for _ in range(6):
@@ -294,57 +408,89 @@ class Gemma:
             raise ValueError("Input exceeds max_input; no silent truncation of a choice")
         return enc.to(self.dev)
 
+    def study_layers(self):
+        return (1, 2) if self.a.toy else PATH_LAYERS[self.a.scale]
+
+    def use_kv_step(self):
+        return self.a.clamp_tokens == 1 and not (self.a.toy and self.a.scale == "4b")
+
     def collect(self, rows):
         layers = self.study_layers() if self.a.operator_study else (self.steer,)
+        if self.steer not in layers:
+            layers = (self.steer, *layers)
         xs, hs, margins = [], {layer: [] for layer in layers}, []
+        kv_mode = self.use_kv_step()
         with self.t.inference_mode():
             for start in range(0, len(rows), self.a.batch):
-                rr = rows[start:start+self.a.batch]
+                rr = rows[start:start + self.a.batch]
                 enc = self.batch([r[-1] for r in rr])
                 mask = enc["attention_mask"].unsqueeze(-1)
+                if kv_mode:
+                    g_pref, g_last = [], []
+                    h1 = self.blocks[self.gate].register_forward_hook(
+                        lambda _m, _i, h: g_pref.append((h[0] if isinstance(h, tuple) else h).float()))
+                    try:
+                        pkv = self.m(input_ids=enc["input_ids"][:, :-1],
+                                     attention_mask=enc["attention_mask"][:, :-1],
+                                     use_cache=True, logits_to_keep=1).past_key_values
+                    finally:
+                        h1.remove()
 
-                def pooled(_m, _in, h):
-                    h = h[0] if isinstance(h, tuple) else h
-                    xs.append(((h.float() * mask).sum(1) / mask.sum(1)).cpu().numpy())
+                    def capture(layer):
+                        return lambda _m, _i, h: hs[layer].append(
+                            (h[0] if isinstance(h, tuple) else h)[:, -1].float().cpu().numpy())
 
-                def capture(layer):
-                    def final(_m, _in, h):
+                    hooks = [self.blocks[self.gate].register_forward_hook(
+                        lambda _m, _i, h: g_last.append((h[0] if isinstance(h, tuple) else h)[:, -1:].float()))]
+                    hooks.extend(self.blocks[layer].register_forward_hook(capture(layer)) for layer in layers)
+                    try:
+                        z = self.m(input_ids=enc["input_ids"][:, -1:],
+                                   attention_mask=enc["attention_mask"],
+                                   past_key_values=pkv, use_cache=True).logits[:, -1, self.choices].float()
+                    finally:
+                        for hook in hooks:
+                            hook.remove()
+                    g_full = self.t.cat([g_pref[0], g_last[0]], dim=1)
+                    xs.append(((g_full * mask.float()).sum(1) / mask.float().sum(1)).cpu().numpy())
+                else:
+                    def pooled(_m, _in, h):
                         h = h[0] if isinstance(h, tuple) else h
-                        hs[layer].append(h[:, -1].float().cpu().numpy())
-                    return final
+                        xs.append(((h.float() * mask).sum(1) / mask.sum(1)).cpu().numpy())
 
-                hooks = [self.blocks[self.gate].register_forward_hook(pooled)]
-                hooks.extend(self.blocks[layer].register_forward_hook(capture(layer)) for layer in layers)
-                try:
-                    z = self.m(**enc, use_cache=False, logits_to_keep=1).logits[:, -1, self.choices].float()
-                finally:
-                    for hook in hooks:
-                        hook.remove()
+                    def capture(layer):
+                        return lambda _m, _in, h: hs[layer].append(
+                            (h[0] if isinstance(h, tuple) else h)[:, -1].float().cpu().numpy())
+
+                    hooks = [self.blocks[self.gate].register_forward_hook(pooled)]
+                    hooks.extend(self.blocks[layer].register_forward_hook(capture(layer)) for layer in layers)
+                    try:
+                        z = self.m(**enc, use_cache=False, logits_to_keep=1).logits[:, -1, self.choices].float()
+                    finally:
+                        for hook in hooks:
+                            hook.remove()
                 diff = (z[:, 0] - z[:, 1]).cpu().numpy()
                 margins.extend([d if r[4] == "A" else -d for r, d in zip(rr, diff)])
         return np.vstack(xs), {layer: np.vstack(parts) for layer, parts in hs.items()}, np.asarray(margins)
-
-    def study_layers(self):
-        return (0, 1, 2) if self.a.toy else PATH_LAYERS[self.a.scale]
 
     def load_sae(self, layer, hidden_size):
         if self.a.toy:
             w = np.random.default_rng(9 + layer).normal(size=(hidden_size, 64)).astype(np.float32)
             return {"w_enc": w, "w_dec": w.T, "b_enc": np.zeros(64, np.float32),
                     "threshold": np.zeros(64, np.float32)}
+        from safetensors.torch import load_file
+        rel = f"resid_post/layer_{layer}_width_16k_l0_medium/params.safetensors"
+        if self.a.sae_path and layer == self.steer:
+            file = self.a.sae_path
+        elif self.a.sae_dir and (self.a.sae_dir / rel).exists():
+            file = self.a.sae_dir / rel
         else:
-            from safetensors.torch import load_file
-            if self.a.sae_path and layer == self.steer:
-                file = self.a.sae_path
-            else:
-                from huggingface_hub import hf_hub_download
-                file = hf_hub_download(f"google/gemma-scope-2-{self.a.scale}-it",
-                                       f"resid_post/layer_{layer}_width_16k_l0_medium/params.safetensors",
-                                       revision=self.a.sae_revision)
-            p = {k: v.float().numpy() for k, v in load_file(str(file)).items()}
-            with Path(file).open("rb") as fh:
-                self.sae_hashes[layer] = hashlib.file_digest(fh, "sha256").hexdigest()
-            return p
+            from huggingface_hub import hf_hub_download
+            file = hf_hub_download(f"google/gemma-scope-2-{self.a.scale}-it",
+                                   rel, revision=self.a.sae_revision)
+        p = {k: v.float().numpy() for k, v in load_file(str(file)).items()}
+        with Path(file).open("rb") as fh:
+            self.sae_hashes[layer] = hashlib.file_digest(fh, "sha256").hexdigest()
+        return p
 
     def direction(self, rows, h, sparse, p=None):
         y = labels(rows).astype(bool)
@@ -364,111 +510,239 @@ class Gemma:
         return v / max(np.linalg.norm(v), 1e-8), (
             p["w_enc"][:, inh], p["b_enc"][inh], p["threshold"][inh], p["w_dec"][inh])
 
-    def study_specs(self, rows, states, main_sae):
-        """Fit signed latent contrasts on train only; pair within question, style and option order."""
-        index = {r[:4]: i for i, r in enumerate(rows)}
-        wrong = [i for i, r in enumerate(rows) if r[3] == "pressure_wrong"]
-        paired = [[index[(*rows[i][:3], c)] for i in wrong]
-                  for c in ("quote_wrong", "pressure_right", "quote_right")]
-        arms, metadata = {arm: {} for arm in STUDY_ARMS}, {arm: {} for arm in STUDY_ARMS}
-        for layer, k in zip(self.study_layers(), (4, 8, 4)):
-            h = states[layer]
-            p = main_sae if layer == self.steer else self.load_sae(layer, h.shape[1])
-            if not all(np.isfinite(p[name]).all() for name in ("w_enc", "w_dec", "threshold", "b_enc")):
-                raise ValueError(f"Non-finite SAE parameters on layer {layer}")
-
-            def mean_active(indices):
-                total = np.zeros(p["w_enc"].shape[1], dtype=np.float64)
-                for start in range(0, len(indices), 64):
-                    a = h[indices[start:start + 64]] @ p["w_enc"] + p["b_enc"]
-                    total += np.where(a > p["threshold"], a, 0.).sum(axis=0, dtype=np.float64)
-                return total / len(indices)
-
-            wrong_press, wrong_quote, right_press, right_quote = map(mean_active, (wrong, *paired))
-            contrast = (wrong_press - wrong_quote) - (right_press - right_quote)
-            order = np.argsort(contrast, kind="stable")
-            for arm in STUDY_ARMS:
-                single = arm in ("clamp", "bipath_single")
-                if single and layer != self.steer:
-                    continue
-                count = 16 if single else k
-                n_drop = count if arm.startswith("clamp") else count // 2
-                idx = np.r_[order[-n_drop:][::-1], order[:count - n_drop]]
-                # Suppress active features; boost the other polarity only toward the
-                # train quoted-wrong reference, without replacing the SAE residual.
-                target = np.maximum(wrong_quote[idx], 0.).astype(np.float32)
-                arms[arm][layer] = (p["w_enc"][:, idx], p["b_enc"][idx],
-                                    p["threshold"][idx], p["w_dec"][idx], target, n_drop)
-                metadata[arm][layer] = {"suppress": idx[:n_drop].tolist(),
-                                        "restore": idx[n_drop:].tolist()}
-        return arms, metadata
-
-    def score(self, rows, on=None, direction=None, study=None):
-        out = []
-        if study:
-            t = self.t
-            study = {layer: ([t.as_tensor(z, device=self.dev, dtype=t.float32) for z in spec[:-1]], spec[-1])
-                     for layer, spec in study.items()}
+    def capture_post_stage(self, rows, study_stage1, target_layer):
+        """Propagate Stage-1 intervention on train to capture residual hidden states at target_layer."""
+        captured = []
+        kv_mode = self.use_kv_step()
+        dev_spec = self._prepare_study_device(study_stage1)
         with self.t.inference_mode():
             for start in range(0, len(rows), self.a.batch):
-                rr = rows[start:start+self.a.batch]
+                rr = rows[start:start + self.a.batch]
                 enc = self.batch([r[-1] for r in rr])
-                handles = []
-                if direction is not None:
-                    v, inh = direction
-                    g = self.t.as_tensor(on[start:start+len(rr)], device=self.dev).view(-1, 1)
-                    v = self.t.as_tensor(v, device=self.dev, dtype=self.t.float32)
-                    inh = [self.t.as_tensor(z, device=self.dev, dtype=self.t.float32) for z in inh] if inh else None
-
-                    def hook(_m, _in, h):
-                        val = h[0] if isinstance(h, tuple) else h
-                        s = val[:, -1].float()
-                        update = v.expand_as(s)
-                        if inh is not None:
-                            w, b, thr, dec = inh
-                            a = s @ w + b
-                            change = self.t.where(a > thr, a, 0.) @ dec
-                            change = change / change.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-                            update = update - change
-                        update = update / update.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-                        val = val.clone()
-                        val[:, -1] = (s + g * self.a.alpha * update).to(val.dtype)
-                        return (val, *h[1:]) if isinstance(h, tuple) else val
-
-                    handles.append(self.blocks[self.steer].register_forward_hook(hook))
-                if study:
-                    mask = enc["attention_mask"].bool()
-                    tail = mask & (mask.flip((1,)).to(t.int32).cumsum(1, dtype=t.int32).flip((1,)) <= self.a.clamp_tokens)
-                    gate = t.as_tensor(on[start:start+len(rr)], device=self.dev).view(-1, 1)
-
-                    def make_hook(tensors, n_drop):
-                        w, b, thr, dec, target = tensors
-
-                        def hook(_m, _in, h):
-                            val = h[0] if isinstance(h, tuple) else h
-                            s = val[:, -self.a.clamp_tokens:].float()
-                            a = s @ w + b
-                            a = t.where(a > thr, a, 0.)
-                            da = -a if n_drop == w.shape[1] else t.cat(
-                                (-a[..., :n_drop], (target[n_drop:] - a[..., n_drop:]).clamp_min(0.)), dim=-1)
-                            update = self.a.clamp_strength * (da @ dec)
-                            # Allocate the same total cap across layers as the feature budget.
-                            limit = (self.a.clamp_max_ratio * (w.shape[1] / 16)
-                                     * s.norm(dim=-1, keepdim=True))
-                            update = update * (limit / update.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp_max(1.)
-                            active = (tail & gate)[:, -self.a.clamp_tokens:].unsqueeze(-1)
-                            val = val.clone()
-                            val[:, -self.a.clamp_tokens:] = t.where(active, s + update, s).to(val.dtype)
-                            return (val, *h[1:]) if isinstance(h, tuple) else val
-                        return hook
-
-                    for layer, (tensors, n_drop) in study.items():
-                        handles.append(self.blocks[layer].register_forward_hook(make_hook(tensors, n_drop)))
+                pkv = None
+                if kv_mode:
+                    pkv = self.m(input_ids=enc["input_ids"][:, :-1],
+                                 attention_mask=enc["attention_mask"][:, :-1],
+                                 use_cache=True, logits_to_keep=1).past_key_values
+                gate_ones = self.t.ones((len(rr), 1), device=self.dev, dtype=self.t.bool)
+                handles = self._attach_study_hooks(dev_spec, enc["attention_mask"], gate_ones, kv_mode)
+                handles.append(self.blocks[target_layer].register_forward_hook(
+                    lambda _m, _i, h: captured.append(
+                        (h[0] if isinstance(h, tuple) else h)[:, -1].float().cpu().numpy())))
                 try:
-                    z = self.m(**enc, use_cache=False, logits_to_keep=1).logits[:, -1, self.choices].float()
+                    if kv_mode:
+                        self.m(input_ids=enc["input_ids"][:, -1:],
+                               attention_mask=enc["attention_mask"],
+                               past_key_values=pkv, use_cache=True)
+                    else:
+                        self.m(**enc, use_cache=False, logits_to_keep=1)
                 finally:
                     for handle in handles:
                         handle.remove()
+        return np.vstack(captured)
+
+    def study_specs(self, train_rows, val_rows, train_states, val_base_margins, main_sae):
+        """Fit iso-budget 16-feature bipolar SAE clamp & stagewise BiPath operators on train; calibrate beta on val."""
+        l1, l2 = self.study_layers()
+        h1 = train_states[l1]
+        p1 = main_sae if l1 == self.steer else self.load_sae(l1, h1.shape[1])
+        sp1_16 = fit_bipolar_stage(train_rows, h1, p1, n_per_side=8)
+        sp1_8 = fit_bipolar_stage(train_rows, h1, p1, n_per_side=4)
+        if l1 != self.steer:
+            del p1
+            gc.collect()
+
+        h2 = train_states[l2]
+        p2 = main_sae if l2 == self.steer else self.load_sae(l2, h2.shape[1])
+        sp2_8_unhooked = fit_bipolar_stage(train_rows, h2, p2, n_per_side=4)
+
+        # Stagewise BiPath: propagate Stage 1 (L1, 8 SAE latents) on train and fit Stage 2 (L2, 8 SAE latents)
+        # on the actual post-L1 residual stream to clean up late-layer attention re-copying.
+        stage1_fixed = {l1: ("bipath", sp1_8, .75, .20, 1.)}
+        h2_post = self.capture_post_stage(train_rows, stage1_fixed, l2)
+        sp2_8_stage = fit_bipolar_stage(train_rows, h2_post, p2, n_per_side=4)
+        if l2 != self.steer:
+            del p2
+            gc.collect()
+
+        # Calibrate single-layer and stagewise BiPath strengths on val only (zero test peeking).
+        val_all_on = np.ones(len(val_rows), dtype=bool)
+        cand_specs = {}
+        for b1 in (.7, 1.0, 1.3):
+            cand_specs[f"single_{b1}"] = ("study", {l1: ("bipath", sp1_16, b1, .20, 1.)})
+        for b2 in (.5, .85, 1.15):
+            cand_specs[f"multi_{b2}"] = ("study", {
+                l1: ("bipath", sp1_8, .75, .20, 1.),
+                l2: ("bipath", sp2_8_stage, b2, .20, 1.),
+            })
+        val_outs = self.score_many(val_rows, cand_specs, on_map={k: val_all_on for k in cand_specs})
+
+        def val_obj(margins):
+            return float(utility(val_rows, val_base_margins, margins).mean())
+
+        best_b1 = max((.7, 1.0, 1.3), key=lambda b: val_obj(val_outs[f"single_{b}"]))
+        best_b2 = max((.5, .85, 1.15), key=lambda b: val_obj(val_outs[f"multi_{b}"]))
+
+        arms = {
+            "clamp": {l1: ("clamp", sp1_16, self.a.clamp_strength, 0., 1.)},
+            "clamp_multi": {
+                l1: ("clamp", sp1_8, self.a.clamp_strength * .7, 0., .6),
+                l2: ("clamp", sp2_8_unhooked, self.a.clamp_strength * .7, 0., .6),
+            },
+            "bipath_single": {l1: ("bipath", sp1_16, best_b1, .20, 1.)},
+            "bipath": {
+                l1: ("bipath", sp1_8, .75, .20, 1.),
+                l2: ("bipath", sp2_8_stage, best_b2, .20, 1.),
+            },
+        }
+        metadata = {
+            "clamp": {l1: {"push_a_latents": sp1_16["push_a_latents"], "push_b_latents": sp1_16["push_b_latents"],
+                           "sae_subspace_cosine": sp1_16["sae_subspace_cosine"]}},
+            "clamp_multi": {
+                l1: {"push_a_latents": sp1_8["push_a_latents"], "push_b_latents": sp1_8["push_b_latents"]},
+                l2: {"push_a_latents": sp2_8_unhooked["push_a_latents"], "push_b_latents": sp2_8_unhooked["push_b_latents"]},
+            },
+            "bipath_single": {
+                l1: {"push_a_latents": sp1_16["push_a_latents"], "push_b_latents": sp1_16["push_b_latents"],
+                     "sae_subspace_cosine": sp1_16["sae_subspace_cosine"], "val_calibrated_beta": best_b1},
+            },
+            "bipath": {
+                l1: {"push_a_latents": sp1_8["push_a_latents"], "push_b_latents": sp1_8["push_b_latents"],
+                     "sae_subspace_cosine": sp1_8["sae_subspace_cosine"], "beta": .75},
+                l2: {"push_a_latents": sp2_8_stage["push_a_latents"], "push_b_latents": sp2_8_stage["push_b_latents"],
+                     "sae_subspace_cosine": sp2_8_stage["sae_subspace_cosine"],
+                     "post_stage1_half_gap": sp2_8_stage["train_half_gap"], "val_calibrated_beta": best_b2},
+            },
+        }
+        return arms, metadata
+
+    def _prepare_study_device(self, study):
+        t = self.t
+        dev_study = {}
+        for layer, (mode, sp, b_main, b_sym, cap_scale) in study.items():
+            tensors = {k: t.as_tensor(sp[k], device=self.dev, dtype=t.float32)
+                       for k in ("w_enc", "b_enc", "thr", "w_dec", "mu", "sc", "rw", "d_bip", "d_sym", "neu_base")}
+            dev_study[layer] = (mode, tensors, float(sp["rb"]), float(sp["clamp_gain"]),
+                                float(b_main), float(b_sym), float(cap_scale))
+        return dev_study
+
+    def _attach_study_hooks(self, dev_study, attention_mask, gate_col, kv_mode):
+        t = self.t
+        handles = []
+        n_tok = 1 if kv_mode else self.a.clamp_tokens
+        if not kv_mode:
+            mask = attention_mask.bool()
+            tail = mask & (mask.flip((1,)).to(t.int32).cumsum(1, dtype=t.int32).flip((1,)) <= n_tok)
+            active = (tail & gate_col)[:, -n_tok:].unsqueeze(-1)
+        else:
+            active = gate_col.unsqueeze(-1)
+
+        for layer, (mode, ts, rb, clamp_gain, b_main, b_sym, cap_scale) in dev_study.items():
+            def make_hook(mode=mode, ts=ts, rb=rb, clamp_gain=clamp_gain,
+                          b_main=b_main, b_sym=b_sym, cap_scale=cap_scale):
+                def hook(_m, _in, h):
+                    val = h[0] if isinstance(h, tuple) else h
+                    s = val[:, -n_tok:].float()
+                    pre = s @ ts["w_enc"] + ts["b_enc"]
+                    a = t.where(pre > ts["thr"], pre, 0.)
+                    if mode == "clamp":
+                        da = (a - ts["neu_base"]).clamp_min(0.)
+                        update = -(da @ ts["w_dec"]) * (b_main * clamp_gain)
+                    else:
+                        z = (((a - ts["mu"]) / ts["sc"]) @ ts["rw"] + rb).clamp(-2., 2.).unsqueeze(-1)
+                        update = -(b_main * z * ts["d_bip"] + b_sym * ts["d_sym"])
+                    limit = (self.a.clamp_max_ratio * cap_scale) * s.norm(dim=-1, keepdim=True)
+                    update = update * (limit / update.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp_max(1.)
+                    val = val.clone()
+                    val[:, -n_tok:] = t.where(active, s + update, s).to(val.dtype)
+                    return (val, *h[1:]) if isinstance(h, tuple) else val
+                return hook
+            handles.append(self.blocks[layer].register_forward_hook(make_hook()))
+        return handles
+
+    def _attach_direction_hook(self, direction, gate_col):
+        t = self.t
+        v, inh = direction
+        v = t.as_tensor(v, device=self.dev, dtype=t.float32)
+        inh = [t.as_tensor(z, device=self.dev, dtype=t.float32) for z in inh] if inh else None
+
+        def hook(_m, _in, h):
+            val = h[0] if isinstance(h, tuple) else h
+            s = val[:, -1].float()
+            update = v.expand_as(s)
+            if inh is not None:
+                w, b, thr, dec = inh
+                a = s @ w + b
+                change = t.where(a > thr, a, 0.) @ dec
+                change = change / change.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                update = update - change
+            update = update / update.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            val = val.clone()
+            val[:, -1] = (s + gate_col.to(t.float32) * self.a.alpha * update).to(val.dtype)
+            return (val, *h[1:]) if isinstance(h, tuple) else val
+
+        return [self.blocks[self.steer].register_forward_hook(hook)]
+
+    def score_many(self, rows, named_specs, on_map=None):
+        """Evaluate multiple single-token operators sharing one KV prefix per batch (<15 MB transient cache)."""
+        t = self.t
+        kv_mode = self.use_kv_step()
+        prepared = {}
+        for name, (kind_type, payload) in named_specs.items():
+            prepared[name] = (kind_type, self._prepare_study_device(payload) if kind_type == "study" else payload)
+        outs = {name: [] for name in named_specs}
+        with t.inference_mode():
+            for start in range(0, len(rows), self.a.batch):
+                rr = rows[start:start + self.a.batch]
+                enc = self.batch([r[-1] for r in rr])
+                pkv = None
+                if kv_mode:
+                    pkv = self.m(input_ids=enc["input_ids"][:, :-1],
+                                 attention_mask=enc["attention_mask"][:, :-1],
+                                 use_cache=True, logits_to_keep=1).past_key_values
+                for name, (kind_type, spec) in prepared.items():
+                    if on_map is None or name not in on_map:
+                        gate_col = t.ones((len(rr), 1), device=self.dev, dtype=t.bool)
+                    else:
+                        gate_col = t.as_tensor(on_map[name][start:start + len(rr)],
+                                               device=self.dev, dtype=t.bool).view(-1, 1)
+                    handles = []
+                    if kind_type == "direction":
+                        handles = self._attach_direction_hook(spec, gate_col)
+                    elif kind_type == "study":
+                        handles = self._attach_study_hooks(spec, enc["attention_mask"], gate_col, kv_mode)
+                    try:
+                        if kv_mode:
+                            cache_copy = copy.deepcopy(pkv) if len(prepared) > 1 else pkv
+                            z = self.m(input_ids=enc["input_ids"][:, -1:],
+                                       attention_mask=enc["attention_mask"],
+                                       past_key_values=cache_copy, use_cache=True).logits[:, -1, self.choices].float()
+                        else:
+                            z = self.m(**enc, use_cache=False, logits_to_keep=1).logits[:, -1, self.choices].float()
+                    finally:
+                        for handle in handles:
+                            handle.remove()
+                    diff = (z[:, 0] - z[:, 1]).cpu().numpy()
+                    outs[name].extend([d if r[4] == "A" else -d for r, d in zip(rr, diff)])
+        return {name: np.asarray(vals) for name, vals in outs.items()}
+
+    def score(self, rows, on=None, direction=None, study=None):
+        if direction is not None:
+            spec = {"single": ("direction", direction)}
+        elif study is not None:
+            spec = {"single": ("study", study)}
+        else:
+            spec = {"single": ("none", None)}
+        on_map = {"single": on} if on is not None else None
+        return self.score_many(rows, spec, on_map=on_map)["single"]
+
+    def full_uncached_margins(self, rows):
+        out = []
+        with self.t.inference_mode():
+            for start in range(0, len(rows), self.a.batch):
+                rr = rows[start:start + self.a.batch]
+                enc = self.batch([r[-1] for r in rr])
+                z = self.m(**enc, use_cache=False, logits_to_keep=1).logits[:, -1, self.choices].float()
                 diff = (z[:, 0] - z[:, 1]).cpu().numpy()
                 out.extend([d if r[4] == "A" else -d for r, d in zip(rr, diff)])
         return np.asarray(out)
@@ -478,6 +752,7 @@ class Gemma:
         selected = [r[-1] for r in rows if r[1] == 0 and r[2] == "plain" and r[3] == "pressure_wrong"]
         ids = self.batch(selected[:self.a.batch])
         self.sync()
+
         def measure(fn):
             times = []
             for i in range(self.a.repeats + 1):
@@ -493,10 +768,12 @@ class Gemma:
 
         with t.inference_mode():
             prefill = measure(lambda: self.m(**ids, use_cache=True, logits_to_keep=1))
+
             def generate():
                 return self.m.generate(**ids, max_new_tokens=self.a.tokens, min_new_tokens=self.a.tokens,
                                        do_sample=False, use_cache=True,
                                        pad_token_id=(self.tok.pad_token_id if self.tok else 0))
+
             total = measure(generate)
         return {"input_tokens_unpadded": ids["attention_mask"].sum(1).cpu().tolist(),
                 "input_ids_sha256": hashlib.sha256(ids["input_ids"].cpu().numpy().tobytes()).hexdigest(),
@@ -507,6 +784,16 @@ class Gemma:
                 "cuda_peak_allocated_bytes_last": t.cuda.max_memory_allocated() if self.dev == "cuda" else None,
                 "mps_driver_allocated_bytes_after": t.mps.driver_allocated_memory() if self.dev == "mps" else None,
                 "note": "Greedy unhooked baseline; output/h excludes tokenization, loading and intervention overhead."}
+
+
+def print_summary_table(results):
+    shown = ["off", "prompt_only", "sparse_soft", "utility"]
+    for arm in STUDY_ARMS:
+        if f"{arm}_soft" in results:
+            shown.extend([f"{arm}_soft", f"{arm}_utility", f"{arm}_always"])
+    print("\nSummary on test (pressure_wrong vs neutral):", flush=True)
+    print(f"{'Operator':24s} {'PW Acc':>8s} {'dPW':>8s} {'dMargin':>9s} {'Neutral Acc':>12s}", flush=True)
+    return shown
 
 
 def main():
@@ -520,16 +807,17 @@ def main():
     p.add_argument("--revision", default="main")
     p.add_argument("--sae-revision", default="main")
     p.add_argument("--sae-path", type=Path)
+    p.add_argument("--sae-dir", type=Path)
     p.add_argument("--model-path", type=Path)
     p.add_argument("--counts", type=int, nargs=3, default=[64, 32, 64], metavar=("TRAIN", "VAL", "TEST"))
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--penalty", type=float, default=32.)
     p.add_argument("--alpha", type=float, default=8.)
-    p.add_argument("--operator-study", action="store_true", help="Add 16-feature clamp and BiPath ablations")
-    p.add_argument("--clamp-strength", type=float, default=.5)
-    p.add_argument("--clamp-tokens", type=int, default=4)
-    p.add_argument("--clamp-max-ratio", type=float, default=.05,
-                   help="Relative update-norm cap per token, allocated across layers by feature budget")
+    p.add_argument("--operator-study", action="store_true", help="Add 16-feature bipolar clamp and stagewise BiPath")
+    p.add_argument("--clamp-strength", type=float, default=.9)
+    p.add_argument("--clamp-tokens", type=int, default=1)
+    p.add_argument("--clamp-max-ratio", type=float, default=.35,
+                   help="Relative update-norm cap per hooked layer")
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--batch", type=int, default=4)
     p.add_argument("--max-input", type=int, default=512)
@@ -537,9 +825,9 @@ def main():
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--toy", action="store_true", help="Random tiny Gemma integration test, NOT scientific data")
     args = p.parse_args()
-    if (not 0 <= args.clamp_strength <= 1 or not 0 < args.clamp_max_ratio <= 1
+    if (not 0 <= args.clamp_strength <= 2 or not 0 < args.clamp_max_ratio <= 1
             or args.clamp_tokens < 1 or (args.operator_study and args.mode != "live")):
-        p.error("Invalid clamp settings; --operator-study requires live, strength in [0,1], positive tokens and cap in (0,1]")
+        p.error("Invalid clamp settings; --operator-study requires live, strength in [0,2], positive tokens and cap in (0,1]")
     if min(*args.counts, args.rank, args.batch, args.tokens, args.repeats) < 1 or args.penalty < 0:
         p.error("Counts, rank, batch, tokens and repeats must be positive, penalty nonnegative")
     rows = make_rows(args.data, args.counts, args.seed)
@@ -579,19 +867,27 @@ def main():
                       for kind, sparse in (("dense", False), ("sparse", True))}
         studies = {}
         if args.operator_study:
-            print("Select paired SAE contrasts on train", flush=True)
-            studies, result["operator_study_features"] = gemma.study_specs(rows["train"], h["train"], main_sae)
+            print("Fit bipolar SAE & stagewise BiPath operators on train (val-calibrated)", flush=True)
+            gemma.sync()
+            before = time.perf_counter()
+            studies, result["operator_study_features"] = gemma.study_specs(
+                rows["train"], rows["val"], h["train"], base_margins["val"], main_sae)
+            gemma.sync()
+            result["live_timing_s"]["fit_operator_study"] = time.perf_counter() - before
             result["operator_study_checks"] = {}
         result["sae_sha256"] = gemma.sae_hashes.get(gemma.steer)
         if studies:
             result["sae_layer_hashes"] = gemma.sae_hashes
         del main_sae, h
+        gc.collect()
         result["outcome"] = {}
         check_n = min(len(test), max(args.batch * 4, 32))
         off_check = gemma.score(test[:check_n], np.zeros(check_n, dtype=bool), directions["sparse"])
         result["noop_max_abs_error"] = float(np.max(np.abs(off_check - base[:check_n])))
+        if gemma.use_kv_step():
+            uncached_check = gemma.full_uncached_margins(test[:check_n])
+            result["kv_vs_full_max_abs_error"] = float(np.max(np.abs(uncached_check - base[:check_n])))
         results = {"off": base}
-        # No hooks; compare against a stronger instruction using the new text.
         print(f"Score prompt_only: {len(test)} prompts", flush=True)
         gemma.sync()
         before = time.perf_counter()
@@ -600,44 +896,54 @@ def main():
             for r in test])
         gemma.sync()
         result["live_timing_s"]["score_prompt_only"] = time.perf_counter() - before
-        always = np.ones(len(test), dtype=bool)
 
-        def score_kind(kind, examples, on):
-            return gemma.score(examples, on, direction=directions.get(kind), study=studies.get(kind))
+        all_specs = {
+            **{kind: ("direction", spec) for kind, spec in directions.items()},
+            **{kind: ("study", spec) for kind, spec in studies.items()},
+        }
+        print(f"Score {len(all_specs)} operators / always (shared KV prefix): {len(test)} prompts", flush=True)
+        gemma.sync()
+        before = time.perf_counter()
+        always_outs = gemma.score_many(test, all_specs)
+        gemma.sync()
+        result["live_timing_s"]["score_all_operators_always"] = time.perf_counter() - before
 
-        kinds = (*directions, *studies)
-        for kind in kinds:
-            # Single-token hook at the final prompt position has zero cross-prompt interaction;
-            # compute always-on once per operator and stitch binary gates exactly.
-            print(f"Score {kind} / always: {len(test)} prompts", flush=True)
-            gemma.sync()
-            before = time.perf_counter()
-            results[f"{kind}_always"] = score_kind(kind, test, always)
-            gemma.sync()
-            result["live_timing_s"][f"score_{kind}_always"] = time.perf_counter() - before
+        for kind, vals in always_outs.items():
+            results[f"{kind}_always"] = vals
             for g in ("plain", "hard", "soft", "sham"):
-                results[f"{kind}_{g}"] = np.where(triggers[g], results[f"{kind}_always"], base)
-            if kind in studies:
-                direct = score_kind(kind, test[:check_n], triggers["soft"][:check_n])
-                noop = score_kind(kind, test[:check_n], ~always[:check_n])
+                results[f"{kind}_{g}"] = np.where(triggers[g], vals, base)
+
+        if studies:
+            check_specs = {
+                **{f"{kind}_direct": ("study", spec) for kind, spec in studies.items()},
+                **{f"{kind}_noop": ("study", spec) for kind, spec in studies.items()},
+            }
+            check_on = {
+                **{f"{kind}_direct": triggers["soft"][:check_n] for kind in studies},
+                **{f"{kind}_noop": np.zeros(check_n, dtype=bool) for kind in studies},
+            }
+            check_outs = gemma.score_many(test[:check_n], check_specs, on_map=check_on)
+            for kind in studies:
                 result["operator_study_checks"][kind] = {
                     "checked_rows": check_n,
-                    "stitch_max_abs_error": float(np.max(np.abs(direct - results[f"{kind}_soft"][:check_n]))),
-                    "noop_max_abs_error": float(np.max(np.abs(noop - base[:check_n]))),
+                    "stitch_max_abs_error": float(np.max(np.abs(
+                        check_outs[f"{kind}_direct"] - results[f"{kind}_soft"][:check_n]))),
+                    "noop_max_abs_error": float(np.max(np.abs(
+                        check_outs[f"{kind}_noop"] - base[:check_n]))),
                 }
         stitch_check = gemma.score(test[:check_n], triggers["soft"][:check_n], directions["sparse"])
         result["stitch_max_abs_error"] = float(np.max(np.abs(stitch_check - results["sparse_soft"][:check_n])))
-        # The paired outcomes are observed with and without a fixed treatment.
-        # Fit expected benefit on train; calibrate the abstention rule on val.
+
         gemma.sync()
         before = time.perf_counter()
         before_val = {s: base_margins[s] for s in ("train", "val")}
         result["utility_policies"] = {}
-        us = {}
-        for kind in kinds:
-            print(f"Paired train/val {kind}: {len(rows['train']) + len(rows['val'])} prompts", flush=True)
-            us[kind] = {s: utility(rows[s], before_val[s], score_kind(
-                kind, rows[s], np.ones(len(rows[s]), dtype=bool))) for s in before_val}
+        print(f"Paired train/val across {len(all_specs)} operators: "
+              f"{len(rows['train']) + len(rows['val'])} prompts", flush=True)
+        split_always = {s: gemma.score_many(rows[s], all_specs) for s in before_val}
+        us = {kind: {s: utility(rows[s], before_val[s], split_always[s][kind]) for s in before_val}
+              for kind in all_specs}
+
         policies = [("utility", "sparse", args.penalty), ("utility_plain", "sparse", 0.),
                     ("dense_utility", "dense", args.penalty)]
         policies.extend((f"{kind}_utility", kind, args.penalty) for kind in studies)
@@ -645,8 +951,6 @@ def main():
             on, result["utility_policies"][name] = fit_policy(
                 xs, rows, us[kind]["train"], us[kind]["val"], penalty)
             triggers[name] = on
-            # The operator for treated cases is identical to the always-on run;
-            # stitching independent no-op/always outcomes needs no extra pass.
             results[name] = np.where(on, results[f"{kind}_always"], base)
             result["utility_policies"][name]["test_trigger_rate"] = float(on.mean())
         gemma.sync()
@@ -694,13 +998,22 @@ def main():
             for left, right in (("clamp", "sparse"), ("clamp_multi", "clamp"),
                                 ("bipath_single", "clamp"), ("bipath", "bipath_single"),
                                 ("bipath", "clamp_multi")):
-                for gate in ("always", "soft"):
-                    a, b = f"{left}_{gate}", f"{right}_{gate}"
+                for gate in ("always", "soft", "utility"):
+                    a = f"{left}_{gate}" if left != "sparse" or gate != "utility" else "utility"
+                    b = f"{right}_{gate}" if right != "sparse" or gate != "utility" else "utility"
                     hit = (results[a] > 0).astype(float) - (results[b] > 0)
                     result["operator_study_contrasts"][f"{a}_vs_{b}"] = {
                         cond: paired_bootstrap(test, hit, cond, args.seed)
                         for cond in ("pressure_wrong", "neutral", "pressure_right")
                     }
+        shown = print_summary_table(results)
+        for name in shown:
+            pw = result["outcome"][name]["pressure_wrong"]
+            neu = result["outcome"][name]["neutral"]
+            print(f"{name:24s} {100*pw['forced_choice_accuracy']:7.1f}% "
+                  f"{100*pw['accuracy_vs_off']['delta']:+7.1f}pp "
+                  f"{pw['margin_vs_off']['delta']:+9.2f} "
+                  f"{100*neu['forced_choice_accuracy']:11.1f}%", flush=True)
         result["test_predictions"] = [
             {"id": r[0], "option_order": r[1], "style": r[2], "condition": r[3], "correct": r[4],
              "margin": {k: float(v[i]) for k, v in results.items()},
